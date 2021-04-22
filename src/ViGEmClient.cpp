@@ -30,6 +30,7 @@ SOFTWARE.
 #include <SetupAPI.h>
 #include <initguid.h>
 #include <Dbghelp.h>
+#include <devpkey.h>
 
 //
 // Driver shared
@@ -148,7 +149,75 @@ public:
     }
 };
 
+struct Version
+{
+    Version(std::string versionStr)
+    {
+        sscanf_s(versionStr.c_str(), "%d.%d.%d.%d", &major, &minor, &revision, &build);
+    }
 
+    int CompareTo(const Version& otherVersion)
+    {
+        static int VERSION_EQUAL = 0;
+        static int VERSION_LESSTHAN = -1;
+        static int VERSION_GREATER = 1;
+
+        int result = VERSION_EQUAL; // Default to equal
+        if (major < otherVersion.major)
+        {
+            result = VERSION_LESSTHAN;
+            return result;
+        }
+        else if (otherVersion.major < major)
+        {
+            result = VERSION_GREATER;
+            return result;
+        }
+
+        if (minor < otherVersion.minor)
+        {
+            result = VERSION_LESSTHAN;
+            return result;
+        }
+        else if (otherVersion.minor < minor)
+        {
+            result = VERSION_GREATER;
+            return result;
+        }
+
+        if (revision < otherVersion.revision)
+        {
+            result = VERSION_LESSTHAN;
+            return result;
+        }
+        else if (otherVersion.revision < revision)
+        {
+            result = VERSION_GREATER;
+            return result;
+        }
+
+        if (build < otherVersion.build)
+        {
+            result = VERSION_LESSTHAN;
+            return result;
+        }
+        else if (otherVersion.build < build)
+        {
+            result = VERSION_GREATER;
+            return result;
+        }
+
+        return result;
+    }
+
+    bool Empty()
+    {
+        bool result = major = 0 && minor == 0 && revision == 0 && build == 0;
+        return result;
+    }
+
+    int major = 0, minor = 0, revision = 0, build = 0;
+};
 
 //
 // Initializes a virtual gamepad object.
@@ -255,6 +324,12 @@ VIGEM_ERROR vigem_connect(PVIGEM_CLIENT vigem)
         return VIGEM_ERROR_BUS_ALREADY_CONNECTED;
     }
 
+    Version latestKnown("0.0.0.0");
+    static Version MIN_SUPPORTED_VIGEMBUS = Version("1.16.112.0");
+    long checkDeviceIndex = -1;
+    DWORD currentIndex = 0;
+    DWORD useDeviceIndex = memberIndex;
+
     const auto deviceInfoSet = SetupDiGetClassDevs(
         &GUID_DEVINTERFACE_BUSENUM_VIGEM,
         nullptr,
@@ -262,15 +337,77 @@ VIGEM_ERROR vigem_connect(PVIGEM_CLIENT vigem)
         DIGCF_PRESENT | DIGCF_DEVICEINTERFACE
     );
 
+    SP_DEVINFO_DATA deviceInfoBuffer = { 0 };
+    deviceInfoBuffer.cbSize = sizeof(SP_DEVINFO_DATA);
+
     // enumerate device instances
-    while (SetupDiEnumDeviceInterfaces(
+    while (SetupDiEnumDeviceInfo(
+        deviceInfoSet,
+        memberIndex++,
+        &deviceInfoBuffer
+    ))
+    {
+        DEVPROPTYPE currentPropType;
+        DWORD propRequiredSize = 0;
+        SetupDiGetDeviceProperty(deviceInfoSet,
+            &deviceInfoBuffer,
+            &DEVPKEY_Device_DriverVersion,
+            &currentPropType,
+            nullptr,
+            0,
+            &propRequiredSize,
+            0);
+
+        if (propRequiredSize > 0)
+        {
+            PWCHAR tempPropBuffer = new WCHAR[propRequiredSize];
+            SetupDiGetDeviceProperty(deviceInfoSet,
+                &deviceInfoBuffer,
+                &DEVPKEY_Device_DriverVersion,
+                &currentPropType,
+                (BYTE*)tempPropBuffer,
+                propRequiredSize,
+                nullptr,
+                0);
+
+            char* szTo = new char[propRequiredSize];
+            WideCharToMultiByte(CP_UTF8, 0, tempPropBuffer, -1, szTo, propRequiredSize, nullptr, nullptr);
+            std::string versionString(szTo);
+            Version tempVersion(versionString);
+
+            if (latestKnown.CompareTo(tempVersion) < 0)
+            {
+                latestKnown = tempVersion;
+                useDeviceIndex = currentIndex;
+                checkDeviceIndex = useDeviceIndex;
+            }
+
+            delete[] tempPropBuffer;
+            delete[] szTo;
+        }
+
+        currentIndex++;
+    }
+
+    if (checkDeviceIndex == -1 || latestKnown.CompareTo(MIN_SUPPORTED_VIGEMBUS) < 0)
+    {
+        SetupDiDestroyDeviceInfoList(deviceInfoSet);
+        error = VIGEM_ERROR_BUS_VERSION_MISMATCH;
+        return error;
+    }
+
+    // only look at one device instance
+    bool lookupRan = false;
+    while (!lookupRan && SetupDiEnumDeviceInterfaces(
         deviceInfoSet,
         nullptr,
         &GUID_DEVINTERFACE_BUSENUM_VIGEM,
-        memberIndex++,
+        useDeviceIndex,
         &deviceInterfaceData
     ))
     {
+        lookupRan = true;
+
         // get required target buffer size
         SetupDiGetDeviceInterfaceDetail(deviceInfoSet, &deviceInterfaceData, nullptr, 0, &requiredSize, nullptr);
 
